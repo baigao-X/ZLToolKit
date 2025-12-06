@@ -41,12 +41,18 @@
                                 | (((epoll_event) & EPOLLHUP) ? Event_Error : 0) \
                                 | (((epoll_event) & EPOLLERR) ? Event_Error : 0)
 #define create_event() epoll_create(EPOLL_SIZE)
+#if !defined(_WIN32)
+#define close_event(fd) close(fd)
+#else
+#define close_event(fd) epoll_close(fd)
+#endif
 #endif //HAS_EPOLL
 
 #if defined(HAS_KQUEUE)
 #include <sys/event.h>
 #define KEVENT_SIZE 1024
 #define create_event() kqueue()
+#define close_event(fd) close(fd)
 #endif // HAS_KQUEUE
 
 using namespace std;
@@ -71,11 +77,13 @@ void EventPoller::addEventPipe() {
 EventPoller::EventPoller(std::string name) {
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
     _event_fd = create_event();
-    if (_event_fd == -1) {
+    if (_event_fd == INVALID_EVENT_FD) {
         throw runtime_error(StrPrinter << "Create event fd failed: " << get_uv_errmsg());
     }
+#if !defined(_WIN32)
     SockUtil::setCloExec(_event_fd);
-#endif //HAS_EPOLL
+#endif
+#endif
 
     _name = std::move(name);
     _logger = Logger::Instance().shared_from_this();
@@ -100,9 +108,9 @@ EventPoller::~EventPoller() {
     shutdown();
     
 #if defined(HAS_EPOLL) || defined(HAS_KQUEUE)
-    if (_event_fd != -1) {
-        close(_event_fd);
-        _event_fd = -1;
+    if (_event_fd != INVALID_EVENT_FD) {
+        close_event(_event_fd);
+        _event_fd = INVALID_EVENT_FD;
     }
 #endif
 
@@ -128,6 +136,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         if (ret != -1) {
             _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
         }
+        _fd_count = _event_map.size();
         return ret;
 #elif defined(HAS_KQUEUE)
         struct kevent kev[2];
@@ -142,6 +151,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         if (ret != -1) {
             _event_map.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
         }
+        _fd_count = _event_map.size();
         return ret;
 #else
 #ifndef _WIN32
@@ -157,6 +167,7 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         record->event = event;
         record->call_back = std::move(cb);
         _event_map.emplace(fd, record);
+        _fd_count = _event_map.size();
         return 0;
 #endif
     }
@@ -181,6 +192,7 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
             ret = epoll_ctl(_event_fd, EPOLL_CTL_DEL, fd, nullptr);
         }
         cb(ret != -1);
+        _fd_count = _event_map.size();
         return ret;
 #elif defined(HAS_KQUEUE)
         int ret = -1;
@@ -193,6 +205,7 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
             ret = kevent(_event_fd, kev, index, nullptr, 0, nullptr);
         }
         cb(ret != -1);
+        _fd_count = _event_map.size();
         return ret;
 #else
         int ret = -1;
@@ -201,6 +214,7 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
             ret = 0;
         }
         cb(ret != -1);
+        _fd_count = _event_map.size();
         return ret;
 #endif //HAS_EPOLL
     }
@@ -247,6 +261,10 @@ int EventPoller::modifyEvent(int fd, int event, PollCompleteCB cb) {
         modifyEvent(fd, event, std::move(cb));
     });
     return 0;
+}
+
+size_t EventPoller::fdCount() const {
+    return _fd_count;
 }
 
 Task::Ptr EventPoller::async(TaskIn task, bool may_sync) {
@@ -358,17 +376,17 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
         }
         _sem_run_started.post();
         _exit_flag = false;
-        uint64_t minDelay;
+        int64_t minDelay;
 #if defined(HAS_EPOLL)
         struct epoll_event events[EPOLL_SIZE];
         while (!_exit_flag) {
             minDelay = getMinDelay();
-            startSleep();//用于统计当前线程负载情况
+            startSleep(); // 用于统计当前线程负载情况
             int ret = epoll_wait(_event_fd, events, EPOLL_SIZE, minDelay);
-            sleepWakeUp();//用于统计当前线程负载情况
+            sleepWakeUp(); // 用于统计当前线程负载情况
             if (ret <= 0) {
-                //超时或被打断  [AUTO-TRANSLATED:7005fded]
-                //Timed out or interrupted
+                // 超时或被打断  [AUTO-TRANSLATED:7005fded]
+                // Timed out or interrupted
                 continue;
             }
 
@@ -378,7 +396,7 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
                 struct epoll_event &ev = events[i];
                 int fd = ev.data.fd;
                 if (_event_cache_expired.count(fd)) {
-                    //event cache refresh
+                    // event cache refresh
                     continue;
                 }
 
@@ -445,10 +463,10 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
         List<Poll_Record::Ptr> callback_list;
         struct timeval tv;
         while (!_exit_flag) {
-            //定时器事件中可能操作_event_map  [AUTO-TRANSLATED:f2a50ee2]
-            //Possible operations on _event_map in timer events
+            // 定时器事件中可能操作_event_map  [AUTO-TRANSLATED:f2a50ee2]
+            // Possible operations on _event_map in timer events
             minDelay = getMinDelay();
-            tv.tv_sec = (decltype(tv.tv_sec)) (minDelay / 1000);
+            tv.tv_sec = (decltype(tv.tv_sec))(minDelay / 1000);
             tv.tv_usec = 1000 * (minDelay % 1000);
 
             set_read.fdZero();
@@ -460,30 +478,30 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
                     max_fd = pr.first;
                 }
                 if (pr.second->event & Event_Read) {
-                    set_read.fdSet(pr.first);//监听管道可读事件
+                    set_read.fdSet(pr.first); // 监听管道可读事件
                 }
                 if (pr.second->event & Event_Write) {
-                    set_write.fdSet(pr.first);//监听管道可写事件
+                    set_write.fdSet(pr.first); // 监听管道可写事件
                 }
                 if (pr.second->event & Event_Error) {
-                    set_err.fdSet(pr.first);//监听管道错误事件
+                    set_err.fdSet(pr.first); // 监听管道错误事件
                 }
             }
 
-            startSleep();//用于统计当前线程负载情况
+            startSleep(); // 用于统计当前线程负载情况
             ret = zl_select(max_fd + 1, &set_read, &set_write, &set_err, minDelay == -1 ? nullptr : &tv);
-            sleepWakeUp();//用于统计当前线程负载情况
+            sleepWakeUp(); // 用于统计当前线程负载情况
 
             if (ret <= 0) {
-                //超时或被打断  [AUTO-TRANSLATED:7005fded]
-                //Timed out or interrupted
+                // 超时或被打断  [AUTO-TRANSLATED:7005fded]
+                // Timed out or interrupted
                 continue;
             }
 
             _event_cache_expired.clear();
 
-            //收集select事件类型  [AUTO-TRANSLATED:9a5c41d3]
-            //Collect select event types
+            // 收集select事件类型  [AUTO-TRANSLATED:9a5c41d3]
+            // Collect select event types
             for (auto &pr : _event_map) {
                 int event = 0;
                 if (set_read.isSet(pr.first)) {
@@ -503,7 +521,7 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
 
             callback_list.for_each([&](Poll_Record::Ptr &record) {
                 if (_event_cache_expired.count(record->fd)) {
-                    //event cache refresh
+                    // event cache refresh
                     return;
                 }
 
